@@ -88,6 +88,12 @@ impl EchoServer {
         self.msg_id += 1;
         self.msg_id
     }
+
+    fn send<W: Write>(msg: &Message, writer: &mut W) -> Result<(), anyhow::Error> {
+        serde_json::to_writer(&mut *writer, &msg).context("Failed to serialize reply message")?;
+        writer.write_all(b"\n").context("Failed to write newline")?;
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -106,16 +112,13 @@ fn main() -> Result<(), anyhow::Error> {
     let Body::Init(ref init_body) = init_msg.body else {
         bail!("Expected Init message as the first received message.");
     };
-
     let mut node = EchoServer::initialize(init_body.node_id.clone());
 
     let init_reply = init_msg
         .prepare_reply(node.incremented_msg_id())
         .context("Failed to prepare InitOk message")?;
 
-    serde_json::to_writer(&mut stdout, &init_reply)
-        .context("Failed to serialize InitOk message")?;
-    stdout.write_all(b"\n").context("Failed to write newline")?;
+    EchoServer::send(&init_reply, &mut stdout)?;
 
     while let Ok(line) = stdin
         .next()
@@ -125,9 +128,7 @@ fn main() -> Result<(), anyhow::Error> {
             .context("Failed to deserialize provided input to STDIN.")?;
 
         if let Some(reply) = msg.prepare_reply(node.incremented_msg_id()) {
-            serde_json::to_writer(&mut stdout, &reply)
-                .context("Failed to serialize reply message")?;
-            stdout.write_all(b"\n").context("Failed to write newline")?;
+            EchoServer::send(&reply, &mut stdout)?;
         } else {
             eprintln!("No reply was prepared for message: {:?}", msg);
         };
