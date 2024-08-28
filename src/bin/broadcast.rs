@@ -6,80 +6,59 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Init {
-    msg_id: u64,
-    node_id: String,
-    node_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct InitOk {
-    msg_id: u64,
-    in_reply_to: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Broadcast {
-    msg_id: u64,
-    message: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BroadcastOk {
-    msg_id: u64,
-    in_reply_to: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Read {
-    msg_id: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReadOk {
-    msg_id: u64,
-    in_reply_to: u64,
-    messages: HashSet<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Topology {
-    msg_id: u64,
-    topology: HashMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TopologyOk {
-    msg_id: u64,
-    in_reply_to: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Gossip {
-    msg_id: u64,
-    messages: HashSet<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GossipOk {
-    msg_id: u64,
-    in_reply_to: u64,
-    messages: HashSet<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Body {
-    Init(Init),
-    InitOk(InitOk),
-    Broadcast(Broadcast),
-    BroadcastOk(BroadcastOk),
-    Read(Read),
-    ReadOk(ReadOk),
-    Topology(Topology),
-    TopologyOk(TopologyOk),
-    Gossip(Gossip),
-    GossipOk(GossipOk),
+    Init {
+        msg_id: u64,
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+
+    InitOk {
+        msg_id: u64,
+        in_reply_to: u64,
+    },
+
+    Broadcast {
+        msg_id: u64,
+        message: u64,
+    },
+
+    BroadcastOk {
+        msg_id: u64,
+        in_reply_to: u64,
+    },
+
+    Read {
+        msg_id: u64,
+    },
+
+    ReadOk {
+        msg_id: u64,
+        in_reply_to: u64,
+        messages: HashSet<u64>,
+    },
+
+    Topology {
+        msg_id: u64,
+        topology: HashMap<String, Vec<String>>,
+    },
+
+    TopologyOk {
+        msg_id: u64,
+        in_reply_to: u64,
+    },
+
+    Gossip {
+        msg_id: u64,
+        messages: HashSet<u64>,
+    },
+
+    GossipOk {
+        msg_id: u64,
+        in_reply_to: u64,
+        messages: HashSet<u64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,60 +79,65 @@ impl Message {
         };
 
         match &mut self.body {
-            Body::Init(init_body) => {
-                node.initialize(init_body.node_id.clone(), sender.clone());
+            Body::Init {
+                msg_id, node_id, ..
+            } => {
+                node.initialize(node_id.clone(), sender.clone());
 
-                build_message_from(Body::InitOk(InitOk {
+                build_message_from(Body::InitOk {
                     msg_id: node.incremented_msg_id(),
-                    in_reply_to: init_body.msg_id,
-                }))
+                    in_reply_to: *msg_id,
+                })
             }
 
-            Body::Broadcast(broadcast_body) => {
-                node.messages.insert(broadcast_body.message);
+            Body::Broadcast { msg_id, message } => {
+                node.messages.insert(*message);
 
-                build_message_from(Body::BroadcastOk(BroadcastOk {
+                build_message_from(Body::BroadcastOk {
                     msg_id: node.incremented_msg_id(),
-                    in_reply_to: broadcast_body.msg_id,
-                }))
+                    in_reply_to: *msg_id,
+                })
             }
 
-            Body::Read(read_body) => build_message_from(Body::ReadOk(ReadOk {
+            Body::Read { msg_id } => build_message_from(Body::ReadOk {
                 msg_id: node.incremented_msg_id(),
-                in_reply_to: read_body.msg_id,
+                in_reply_to: *msg_id,
                 messages: node.messages.clone(),
-            })),
+            }),
 
-            Body::Topology(topology_body) => {
-                if let Some(neighbours) = topology_body.topology.remove(&node.node_id) {
+            Body::Topology { msg_id, topology } => {
+                if let Some(neighbours) = topology.remove(&node.node_id) {
                     node.neighbours = neighbours;
                 }
 
-                build_message_from(Body::TopologyOk(TopologyOk {
+                build_message_from(Body::TopologyOk {
                     msg_id: node.incremented_msg_id(),
-                    in_reply_to: topology_body.msg_id,
-                }))
+                    in_reply_to: *msg_id,
+                })
             }
 
-            Body::Gossip(gossip_body) => {
-                node.messages.extend(&gossip_body.messages);
+            Body::Gossip { msg_id, messages } => {
+                node.messages.extend(messages.iter().copied());
 
-                build_message_from(Body::GossipOk(GossipOk {
+                build_message_from(Body::GossipOk {
                     msg_id: node.incremented_msg_id(),
-                    in_reply_to: gossip_body.msg_id,
-                    messages: gossip_body.messages.clone(),
-                }))
+                    in_reply_to: *msg_id,
+                    messages: messages.clone(),
+                })
             }
 
-            Body::GossipOk(gossip_ok_body) => {
+            Body::GossipOk { messages, .. } => {
                 node.messages_seen_by_others
                     .entry(self.src.clone())
                     .or_default()
-                    .extend(&gossip_ok_body.messages);
+                    .extend(messages.iter().copied());
                 None
             }
 
-            Body::InitOk(_) | Body::BroadcastOk(_) | Body::ReadOk(_) | Body::TopologyOk(_) => None,
+            Body::InitOk { .. }
+            | Body::BroadcastOk { .. }
+            | Body::ReadOk { .. }
+            | Body::TopologyOk { .. } => None,
         }
     }
 }
@@ -193,10 +177,10 @@ impl Event {
                     let gossip = Message {
                         src: node.node_id.clone(),
                         dest: node.neighbours[i].clone(),
-                        body: Body::Gossip(Gossip {
+                        body: Body::Gossip {
                             msg_id: node.incremented_msg_id(),
                             messages: new_messages,
-                        }),
+                        },
                     };
                     Node::send(&gossip, &mut output)?;
                 }
