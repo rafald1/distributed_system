@@ -61,6 +61,13 @@ struct Gossip {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct GossipOk {
+    msg_id: u64,
+    in_reply_to: u64,
+    messages: HashSet<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Body {
     Init(Init),
@@ -72,6 +79,7 @@ enum Body {
     Topology(Topology),
     TopologyOk(TopologyOk),
     Gossip(Gossip),
+    GossipOk(GossipOk),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,6 +137,19 @@ impl Message {
 
             Body::Gossip(gossip_body) => {
                 node.messages.extend(&gossip_body.messages);
+
+                build_message_from(Body::GossipOk(GossipOk {
+                    msg_id: node.incremented_msg_id(),
+                    in_reply_to: gossip_body.msg_id,
+                    messages: gossip_body.messages.clone(),
+                }))
+            }
+
+            Body::GossipOk(gossip_ok_body) => {
+                node.messages_seen_by_others
+                    .entry(self.src.clone())
+                    .or_default()
+                    .extend(&gossip_ok_body.messages);
                 None
             }
 
@@ -160,12 +181,21 @@ impl Event {
 
             Event::GossipRequested => {
                 for i in 0..node.neighbours.len() {
+                    let new_messages: HashSet<u64> = if let Some(seen_messages) = node
+                        .messages_seen_by_others
+                        .get(&node.neighbours[i].clone())
+                    {
+                        node.messages.difference(seen_messages).cloned().collect()
+                    } else {
+                        node.messages.clone()
+                    };
+
                     let gossip = Message {
                         src: node.node_id.clone(),
                         dest: node.neighbours[i].clone(),
                         body: Body::Gossip(Gossip {
                             msg_id: node.incremented_msg_id(),
-                            messages: node.messages.clone(),
+                            messages: new_messages,
                         }),
                     };
                     Node::send(&gossip, &mut output)?;
@@ -183,6 +213,7 @@ struct Node {
     msg_id: u64,
     messages: HashSet<u64>,
     neighbours: Vec<String>,
+    messages_seen_by_others: HashMap<String, HashSet<u64>>,
 }
 
 impl Node {
@@ -192,6 +223,7 @@ impl Node {
             msg_id: 0,
             messages: HashSet::new(),
             neighbours: Vec::new(),
+            messages_seen_by_others: HashMap::new(),
         }
     }
 
@@ -200,7 +232,7 @@ impl Node {
 
         // TODO: shutdown signal
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(150));
             let _ = sender.send(Event::GossipRequested);
         });
     }
