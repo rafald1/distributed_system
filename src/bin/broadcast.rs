@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, StdoutLock, Write};
+use std::sync::mpsc::Sender;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,12 @@ struct TopologyOk {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct Gossip {
+    msg_id: u64,
+    messages: HashSet<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Body {
     Init(Init),
@@ -64,6 +71,7 @@ enum Body {
     ReadOk(ReadOk),
     Topology(Topology),
     TopologyOk(TopologyOk),
+    Gossip(Gossip),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,78 +82,99 @@ struct Message {
 }
 
 impl Message {
-    fn process_received_message(&mut self, node: &mut Node) -> Vec<Self> {
-        let mut responses: Vec<Message> = Vec::new();
+    fn process_received_message(&mut self, node: &mut Node, sender: Sender<Event>) -> Option<Self> {
+        let build_message_from = |body: Body| -> Option<Self> {
+            Some(Self {
+                src: self.dest.clone(),
+                dest: self.src.clone(),
+                body,
+            })
+        };
 
-        match &self.body {
+        match &mut self.body {
             Body::Init(init_body) => {
-                node.initialize(init_body.node_id.clone());
+                node.initialize(init_body.node_id.clone(), sender.clone());
 
-                responses.push(Self {
-                    src: self.dest.clone(),
-                    dest: self.src.clone(),
-                    body: Body::InitOk(InitOk {
-                        msg_id: node.incremented_msg_id(),
-                        in_reply_to: init_body.msg_id,
-                    }),
-                });
+                build_message_from(Body::InitOk(InitOk {
+                    msg_id: node.incremented_msg_id(),
+                    in_reply_to: init_body.msg_id,
+                }))
             }
 
             Body::Broadcast(broadcast_body) => {
-                (0..node.neighbours.len()).for_each(|i| {
-                    responses.push(Self {
-                        src: node.node_id.clone(),
-                        dest: node.neighbours[i].clone(),
-                        body: Body::Broadcast(Broadcast {
-                            msg_id: node.incremented_msg_id(),
-                            message: broadcast_body.message,
-                        }),
-                    })
-                });
-                
                 node.messages.insert(broadcast_body.message);
 
-                responses.push(Self {
-                    src: self.dest.clone(),
-                    dest: self.src.clone(),
-                    body: Body::BroadcastOk(BroadcastOk {
-                        msg_id: node.incremented_msg_id(),
-                        in_reply_to: broadcast_body.msg_id,
-                    }),
-                });
+                build_message_from(Body::BroadcastOk(BroadcastOk {
+                    msg_id: node.incremented_msg_id(),
+                    in_reply_to: broadcast_body.msg_id,
+                }))
             }
 
-            Body::Read(read_body) => {
-                responses.push(Self {
-                    src: self.dest.clone(),
-                    dest: self.src.clone(),
-                    body: Body::ReadOk(ReadOk {
-                        msg_id: node.incremented_msg_id(),
-                        in_reply_to: read_body.msg_id,
-                        messages: node.messages.clone(),
-                    }),
-                });
-            }
+            Body::Read(read_body) => build_message_from(Body::ReadOk(ReadOk {
+                msg_id: node.incremented_msg_id(),
+                in_reply_to: read_body.msg_id,
+                messages: node.messages.clone(),
+            })),
 
             Body::Topology(topology_body) => {
-                if let Some(neighbours) = topology_body.topology.get(&node.node_id) {
-                    node.neighbours = neighbours.clone();
+                if let Some(neighbours) = topology_body.topology.remove(&node.node_id) {
+                    node.neighbours = neighbours;
                 }
 
-                responses.push(Self {
-                    src: self.dest.clone(),
-                    dest: self.src.clone(),
-                    body: Body::TopologyOk(TopologyOk {
-                        msg_id: node.incremented_msg_id(),
-                        in_reply_to: topology_body.msg_id,
-                    }),
-                });
+                build_message_from(Body::TopologyOk(TopologyOk {
+                    msg_id: node.incremented_msg_id(),
+                    in_reply_to: topology_body.msg_id,
+                }))
             }
 
-            Body::InitOk(_) | Body::BroadcastOk(_) | Body::ReadOk(_) | Body::TopologyOk(_) => {}
-        }
+            Body::Gossip(gossip_body) => {
+                node.messages.extend(&gossip_body.messages);
+                None
+            }
 
-        responses
+            Body::InitOk(_) | Body::BroadcastOk(_) | Body::ReadOk(_) | Body::TopologyOk(_) => None,
+        }
+    }
+}
+
+enum Event {
+    Message(Message),
+    GossipRequested,
+    ShutdownSignal,
+}
+
+impl Event {
+    fn process_received_event(
+        &mut self,
+        node: &mut Node,
+        sender: &Sender<Event>,
+        mut output: &mut StdoutLock,
+    ) -> Result<(), anyhow::Error> {
+        match self {
+            Event::Message(message) => {
+                if let Some(reply) = message.process_received_message(node, sender.clone()) {
+                    Node::send(&reply, &mut output)?;
+                }
+                Ok(())
+            }
+
+            Event::GossipRequested => {
+                for i in 0..node.neighbours.len() {
+                    let gossip = Message {
+                        src: node.node_id.clone(),
+                        dest: node.neighbours[i].clone(),
+                        body: Body::Gossip(Gossip {
+                            msg_id: node.incremented_msg_id(),
+                            messages: node.messages.clone(),
+                        }),
+                    };
+                    Node::send(&gossip, &mut output)?;
+                }
+                Ok(())
+            }
+
+            Event::ShutdownSignal => Ok(()),
+        }
     }
 }
 
@@ -166,8 +195,14 @@ impl Node {
         }
     }
 
-    fn initialize(&mut self, node_id: String) {
+    fn initialize(&mut self, node_id: String, sender: Sender<Event>) {
         self.node_id = node_id;
+
+        // TODO: shutdown signal
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = sender.send(Event::GossipRequested);
+        });
     }
 
     fn incremented_msg_id(&mut self) -> u64 {
@@ -183,23 +218,38 @@ impl Node {
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    let stdin = std::io::stdin().lock();
-    let mut stdin = stdin.lines();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender_clone = sender.clone();
     let mut stdout = std::io::stdout().lock();
-
     let mut node = Node::new();
 
-    while let Ok(line) = stdin
-        .next()
-        .context("Maelstrom should provide input to STDIN.")?
-    {
-        let mut msg: Message = serde_json::from_str(&line)
-            .context("Failed to deserialize provided input to STDIN.")?;
+    let join_handle = std::thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        let mut stdin = stdin.lines();
 
-        for message in msg.process_received_message(&mut node) {
-            Node::send(&message, &mut stdout)?;
+        while let Ok(line) = stdin
+            .next()
+            .context("Maelstrom should provide input to STDIN.")?
+        {
+            let msg: Message = serde_json::from_str(&line)
+                .context("Failed to deserialize provided input to STDIN.")?;
+
+            if sender_clone.send(Event::Message(msg)).is_err() {
+                return Ok::<_, anyhow::Error>(());
+            }
         }
+        Ok(())
+    });
+
+    for mut event in receiver {
+        event.process_received_event(&mut node, &sender, &mut stdout)?
     }
+
+    sender.send(Event::ShutdownSignal)?;
+
+    join_handle
+        .join()
+        .map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))??;
 
     Ok(())
 }
